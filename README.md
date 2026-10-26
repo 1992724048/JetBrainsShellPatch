@@ -1,3 +1,5 @@
+如何使用请查看：https://issuimo.com/2026/10/27/resharper-patch/
+
 # JetBrainsShellPatch
 
 Dev/debug helper that patches `JetBrains.Platform.Shell.dll` to bypass two license
