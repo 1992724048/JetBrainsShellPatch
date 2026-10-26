@@ -6,3 +6,4 @@ obj/
 publish/
 *.backup
 *.backup-*
+_ReSharper.Caches
