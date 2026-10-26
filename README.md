@@ -2,8 +2,8 @@
 
 Dev/debug helper that patches `JetBrains.Platform.Shell.dll` to bypass two license
 checks. It locates the target methods by name + signature (no hard-coded offsets),
-keeps a single `<dll>.backup` copy of the original, and verifies the result by
-re-reading the file.
+keeps a single `<dll>.backup` copy of the original, writes atomically, and verifies
+the result by re-reading the file.
 
 > For development and debugging only. See "Risks & Disclaimer" below.
 
@@ -97,15 +97,38 @@ Exactly one backup is kept per DLL: `<dll>.backup`, next to the DLL.
 
 - Created only on the first patch run and **never overwritten** afterwards, so it
   always keeps the original from before the first patch.
+- Every new backup is read back and compared byte-for-byte with the file it was
+  copied from. A copy that does not match is deleted and the run reports `FAILED`
+  with `backup verification failed` in the detail.
 - A run that reports `ALREADY PATCHED` writes nothing and creates no backup.
-- If `<dll>.backup` already exists it is reused as-is; the reported detail states
-  whether it is identical to or different from the current DLL.
+- An existing `<dll>.backup` is reused only when it parses as a valid CLI PE image.
+  The reported detail states whether it is identical to or different from the
+  current DLL.
+- If the existing backup is truncated or otherwise corrupt, it is renamed to
+  `<dll>.backup.corrupt` (a timestamp suffix is appended when that name is already
+  taken) and a fresh, verified backup is built from the DLL as it sits on disk.
+  The detail then contains `corrupt backup replaced`.
 
 Rollback is a single file copy:
 
 ```powershell
 Copy-Item "JetBrains.Platform.Shell.dll.backup" "JetBrains.Platform.Shell.dll" -Force
 ```
+
+## Atomic write & automatic rollback
+
+The patched bytes are written to `<dll>.patching.tmp` in the same directory and
+then swapped in with `File.Replace`, so the DLL is never truncated in place. File
+systems without atomic replace support fall back to
+`File.Move(tmp, dll, overwrite: true)`. The temporary file is removed when the
+write fails.
+
+If the swap fails (`write failed`) or the post-write verification fails
+(`verify failed`), the tool copies the verified backup back over the DLL and adds
+`restored from backup` to the detail. The status is still `FAILED` - a restore does
+not turn the run into a success. If the restore itself fails, the detail reports
+that and the file is left untouched for manual recovery; the tool never deletes a
+DLL.
 
 ## Risks & Disclaimer
 
@@ -128,5 +151,6 @@ Copy-Item "JetBrains.Platform.Shell.dll.backup" "JetBrains.Platform.Shell.dll" -
 - Requires the target DLL's `AddLicense` to read `validateLicenseKey` only via
   `ldarg.3` / `ldarg.s 3`. `ldarga`/`starg` usage fails fast instead of patching.
 - The single backup is never refreshed: after a JetBrains update replaces the DLL,
-  the old `<dll>.backup` is kept and reported as differing from the current file.
-  Delete it manually if you want the next run to capture the new original.
+  the old `<dll>.backup` is kept and reported as differing from the current file
+  (only a corrupt backup is moved aside and rebuilt). Delete it manually if you
+  want the next run to capture the new original.

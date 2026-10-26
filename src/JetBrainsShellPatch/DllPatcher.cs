@@ -53,6 +53,8 @@ internal sealed class DllPatcher
     private const int FatMaxStack = 8;
 
     private const string BackupSuffix = ".backup";
+    private const string CorruptBackupSuffix = ".corrupt";
+    private const string TempSuffix = ".patching.tmp";
 
     public PatchResult Process(string dllPath, bool dryRun)
     {
@@ -158,20 +160,22 @@ internal sealed class DllPatcher
             return new PatchResult { Path = dllPath, Status = PatchStatus.Failed, Detail = "backup failed: " + ex.Message };
         }
 
+        // Write through a sibling temp file so a failed write cannot leave a
+        // truncated DLL behind, and restore the backup if the swap still fails.
         try
         {
-            File.WriteAllBytes(dllPath, bytes);
+            WriteAtomic(dllPath, bytes);
         }
         catch (Exception ex)
         {
-            return new PatchResult { Path = dllPath, Status = PatchStatus.Failed, Detail = "write failed: " + ex.Message, BackupPath = backup.Path };
+            return FailedWithRestore(dllPath, "write failed: " + ex.Message, backup);
         }
 
         // Post-write verification (re-read the file with Cecil).
         var verify = Verifier.Verify(dllPath);
         if (!verify.Ok)
         {
-            return new PatchResult { Path = dllPath, Status = PatchStatus.Failed, Detail = "verify failed: " + verify.Message, BackupPath = backup.Path };
+            return FailedWithRestore(dllPath, "verify failed: " + verify.Message, backup);
         }
 
         return new PatchResult
@@ -485,6 +489,7 @@ internal sealed class DllPatcher
     /// <summary>
     /// Ensures the single backup file next to the DLL. It is written once and
     /// never overwritten, so it keeps the original from before the first patch.
+    /// A kept backup is reused only when it parses as a CLI PE image.
     /// </summary>
     private static BackupOutcome EnsureBackup(string dllPath)
     {
@@ -492,10 +497,21 @@ internal sealed class DllPatcher
 
         if (File.Exists(backupPath))
         {
-            return new BackupOutcome { Path = backupPath, Note = DescribeExistingBackup(backupPath, dllPath) };
+            if (IsValidPeImage(backupPath))
+            {
+                return new BackupOutcome { Path = backupPath, Note = DescribeExistingBackup(backupPath, dllPath) };
+            }
+
+            string corruptPath = MoveAsideCorruptBackup(backupPath);
+            CreateVerifiedBackup(dllPath, backupPath);
+            return new BackupOutcome
+            {
+                Path = backupPath,
+                Note = "corrupt backup replaced (previous copy kept as " + Path.GetFileName(corruptPath) + ")"
+            };
         }
 
-        File.Copy(dllPath, backupPath);
+        CreateVerifiedBackup(dllPath, backupPath);
         return new BackupOutcome { Path = backupPath, Note = "backup created" };
     }
 
@@ -518,5 +534,164 @@ internal sealed class DllPatcher
         }
 
         return "existing backup kept, " + comparison;
+    }
+
+    /// <summary>
+    /// Copies the DLL into the backup path and proves the copy is byte-identical
+    /// to the pre-write file, so a short or torn copy is never kept as a restore
+    /// source.
+    /// </summary>
+    private static void CreateVerifiedBackup(string dllPath, string backupPath)
+    {
+        byte[] expected = File.ReadAllBytes(dllPath);
+
+        bool copied = false;
+        try
+        {
+            File.Copy(dllPath, backupPath, overwrite: false);
+            copied = true;
+
+            if (!File.ReadAllBytes(backupPath).SequenceEqual(expected))
+            {
+                throw new IOException("backup verification failed: copy differs from " + Path.GetFileName(dllPath));
+            }
+        }
+        catch (Exception)
+        {
+            if (copied)
+            {
+                TryDelete(backupPath);
+            }
+
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Structural check that a file is a CLI PE image. A truncated or overwritten
+    /// backup fails this and must never be used to restore a DLL.
+    /// </summary>
+    private static bool IsValidPeImage(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var reader = new PEReader(stream);
+
+            return reader.PEHeaders.PEHeader != null && reader.PEHeaders.CorHeader != null;
+        }
+        catch (Exception ex) when (ex is IOException or BadImageFormatException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Moves a corrupt backup aside so its bytes stay available for inspection
+    /// while a fresh backup takes its place.
+    /// </summary>
+    private static string MoveAsideCorruptBackup(string backupPath)
+    {
+        string corruptPath = backupPath + CorruptBackupSuffix;
+        if (File.Exists(corruptPath))
+        {
+            string stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmssfff");
+            corruptPath = backupPath + CorruptBackupSuffix + "." + stamp;
+            for (int attempt = 1; File.Exists(corruptPath); attempt++)
+            {
+                corruptPath = backupPath + CorruptBackupSuffix + "." + stamp + "." + attempt;
+            }
+        }
+
+        File.Move(backupPath, corruptPath, overwrite: false);
+        return corruptPath;
+    }
+
+    /// <summary>
+    /// Writes the patched bytes to a sibling temp file and swaps it in, so the
+    /// DLL is either fully old or fully new even when the write fails midway.
+    /// </summary>
+    private static void WriteAtomic(string dllPath, byte[] bytes)
+    {
+        string tempPath = dllPath + TempSuffix;
+        try
+        {
+            File.WriteAllBytes(tempPath, bytes);
+            ReplaceOrMove(tempPath, dllPath);
+        }
+        catch (Exception)
+        {
+            TryDelete(tempPath);
+            throw;
+        }
+    }
+
+    private static void ReplaceOrMove(string tempPath, string dllPath)
+    {
+        try
+        {
+            File.Replace(tempPath, dllPath, destinationBackupFileName: null);
+        }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or IOException or UnauthorizedAccessException)
+        {
+            // File systems without atomic replace support fall back to a move.
+            File.Move(tempPath, dllPath, overwrite: true);
+        }
+    }
+
+    /// <summary>
+    /// Reports the failure and puts the backed-up bytes back when possible, so a
+    /// broken DLL is not left behind. The result still reports failure.
+    /// </summary>
+    private static PatchResult FailedWithRestore(string dllPath, string detail, BackupOutcome backup)
+    {
+        try
+        {
+            File.Copy(backup.Path, dllPath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            return new PatchResult
+            {
+                Path = dllPath,
+                Status = PatchStatus.Failed,
+                Detail = detail + "; restore from backup failed: " + ex.Message,
+                BackupPath = backup.Path
+            };
+        }
+
+        return new PatchResult
+        {
+            Path = dllPath,
+            Status = PatchStatus.Failed,
+            Detail = detail + "; " + DescribeRestore(backup.Path, dllPath),
+            BackupPath = backup.Path
+        };
+    }
+
+    private static string DescribeRestore(string backupPath, string dllPath)
+    {
+        try
+        {
+            return File.ReadAllBytes(backupPath).SequenceEqual(File.ReadAllBytes(dllPath))
+                ? "restored from backup"
+                : "restored from backup, but the copy is not byte-identical";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return "restored from backup (comparison skipped: " + ex.Message + ")";
+        }
+    }
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Best effort: a leftover temp/corrupt file must not mask the real error.
+        }
     }
 }
