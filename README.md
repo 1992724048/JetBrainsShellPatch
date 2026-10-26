@@ -2,7 +2,8 @@
 
 Dev/debug helper that patches `JetBrains.Platform.Shell.dll` to bypass two license
 checks. It locates the target methods by name + signature (no hard-coded offsets),
-backs up each DLL before writing, and verifies the result by re-reading the file.
+keeps a single `<dll>.backup` copy of the original, and verifies the result by
+re-reading the file.
 
 > For development and debugging only. See "Risks & Disclaimer" below.
 
@@ -30,6 +31,8 @@ assemblies). Assembly identity (public key / token) is preserved byte-for-byte.
    reported `FAILED` rather than risk corruption.
 
 ## Build
+
+Requires the .NET SDK 10.0 or later.
 
 ```powershell
 dotnet build JetBrainsShellPatch.sln -c Release
@@ -90,13 +93,18 @@ file-locked and the entry is reported `SKIPPED (locked)`.
 
 ## Backup & rollback
 
-Before writing, each DLL is copied to `<dll>.backup-<yyyyMMdd-HHmmss>` (a numeric
-suffix is appended if that name already exists; existing backups are never
-overwritten). To roll back, overwrite the patched DLL with the backup:
+Exactly one backup is kept per DLL: `<dll>.backup`, next to the DLL.
+
+- Created only on the first patch run and **never overwritten** afterwards, so it
+  always keeps the original from before the first patch.
+- A run that reports `ALREADY PATCHED` writes nothing and creates no backup.
+- If `<dll>.backup` already exists it is reused as-is; the reported detail states
+  whether it is identical to or different from the current DLL.
+
+Rollback is a single file copy:
 
 ```powershell
-Copy-Item "JetBrains.Platform.Shell.dll.backup-20260101-120000" `
-          "JetBrains.Platform.Shell.dll" -Force
+Copy-Item "JetBrains.Platform.Shell.dll.backup" "JetBrains.Platform.Shell.dll" -Force
 ```
 
 ## Risks & Disclaimer
@@ -119,3 +127,6 @@ Copy-Item "JetBrains.Platform.Shell.dll.backup-20260101-120000" `
 - No system or global environment is modified; NuGet packages are project-local.
 - Requires the target DLL's `AddLicense` to read `validateLicenseKey` only via
   `ldarg.3` / `ldarg.s 3`. `ldarga`/`starg` usage fails fast instead of patching.
+- The single backup is never refreshed: after a JetBrains update replaces the DLL,
+  the old `<dll>.backup` is kept and reported as differing from the current file.
+  Delete it manually if you want the next run to capture the new original.

@@ -28,6 +28,13 @@ internal sealed class PatchResult
     public long Changes { get; init; }
 }
 
+/// <summary>Backup file used for a patch run.</summary>
+internal sealed class BackupOutcome
+{
+    public required string Path { get; init; }
+    public required string Note { get; init; }
+}
+
 /// <summary>
 /// Locates the two target methods in JetBrains.Platform.Shell.dll and applies
 /// metadata-free, equal-length IL byte patches. Never rewrites metadata (Cecil
@@ -44,6 +51,8 @@ internal sealed class DllPatcher
     private const byte OpLdargS = 0x11;   // ldarg.s (followed by byte arg index)
 
     private const int FatMaxStack = 8;
+
+    private const string BackupSuffix = ".backup";
 
     public PatchResult Process(string dllPath, bool dryRun)
     {
@@ -138,11 +147,11 @@ internal sealed class DllPatcher
             };
         }
 
-        // Backup then write.
-        string backup;
+        // Backup (created once, never overwritten) then write.
+        BackupOutcome backup;
         try
         {
-            backup = CreateBackup(dllPath);
+            backup = EnsureBackup(dllPath);
         }
         catch (Exception ex)
         {
@@ -155,22 +164,22 @@ internal sealed class DllPatcher
         }
         catch (Exception ex)
         {
-            return new PatchResult { Path = dllPath, Status = PatchStatus.Failed, Detail = "write failed: " + ex.Message, BackupPath = backup };
+            return new PatchResult { Path = dllPath, Status = PatchStatus.Failed, Detail = "write failed: " + ex.Message, BackupPath = backup.Path };
         }
 
         // Post-write verification (re-read the file with Cecil).
         var verify = Verifier.Verify(dllPath);
         if (!verify.Ok)
         {
-            return new PatchResult { Path = dllPath, Status = PatchStatus.Failed, Detail = "verify failed: " + verify.Message, BackupPath = backup };
+            return new PatchResult { Path = dllPath, Status = PatchStatus.Failed, Detail = "verify failed: " + verify.Message, BackupPath = backup.Path };
         }
 
         return new PatchResult
         {
             Path = dllPath,
             Status = PatchStatus.Patched,
-            Detail = string.Join("; ", notes) + "; verify PASS",
-            BackupPath = backup,
+            Detail = string.Join("; ", notes) + "; verify PASS; " + backup.Note,
+            BackupPath = backup.Path,
             Changes = changes
         };
     }
@@ -473,18 +482,41 @@ internal sealed class DllPatcher
         }
     }
 
-    private static string CreateBackup(string dllPath)
+    /// <summary>
+    /// Ensures the single backup file next to the DLL. It is written once and
+    /// never overwritten, so it keeps the original from before the first patch.
+    /// </summary>
+    private static BackupOutcome EnsureBackup(string dllPath)
     {
-        string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
-        string candidate = dllPath + ".backup-" + stamp;
-        int n = 2;
-        while (File.Exists(candidate))
+        string backupPath = dllPath + BackupSuffix;
+
+        if (File.Exists(backupPath))
         {
-            candidate = dllPath + ".backup-" + stamp + "-" + n;
-            n++;
+            return new BackupOutcome { Path = backupPath, Note = DescribeExistingBackup(backupPath, dllPath) };
         }
 
-        File.Copy(dllPath, candidate);
-        return candidate;
+        File.Copy(dllPath, backupPath);
+        return new BackupOutcome { Path = backupPath, Note = "backup created" };
+    }
+
+    /// <summary>
+    /// Compares the kept backup with the DLL on disk. Called before the patched
+    /// bytes are written, so the comparison is against the pre-patch file.
+    /// </summary>
+    private static string DescribeExistingBackup(string backupPath, string dllPath)
+    {
+        string comparison;
+        try
+        {
+            comparison = File.ReadAllBytes(backupPath).SequenceEqual(File.ReadAllBytes(dllPath))
+                ? "identical to the current file"
+                : "differs from the current file, kept as-is (possibly an older build)";
+        }
+        catch (Exception ex)
+        {
+            comparison = "not comparable (" + ex.Message + ")";
+        }
+
+        return "existing backup kept, " + comparison;
     }
 }
