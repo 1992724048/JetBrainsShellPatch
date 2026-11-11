@@ -42,8 +42,11 @@ internal sealed class BackupOutcome
 /// </summary>
 internal sealed class DllPatcher
 {
-    // ECMA-335 single-byte opcodes used for the byte patches.
-    private const byte OpLdarg3 = 0x05;   // ldarg.3  (reads IL arg index 3)
+    // ECMA-335 opcodes used for the byte patches.
+    private const byte OpLdarg0 = 0x02;   // ldarg.0
+    private const byte OpLdarg1 = 0x03;   // ldarg.1
+    private const byte OpLdarg2 = 0x04;   // ldarg.2
+    private const byte OpLdarg3 = 0x05;   // ldarg.3
     private const byte OpLdcI40 = 0x16;   // ldc.i4.0
     private const byte OpNop = 0x00;      // nop
     private const byte OpRet = 0x2A;      // ret
@@ -112,7 +115,7 @@ internal sealed class DllPatcher
             }
         }
 
-        // Patch B: AddLicense param idx3 reads.
+        // Patch B: AddLicense validateLicenseKey reads.
         if (!locate.AddLicenseAlreadyPatched)
         {
             if (locate.AddLicenseUnsupported != null)
@@ -122,9 +125,9 @@ internal sealed class DllPatcher
 
             try
             {
-                long b = PatchAddLicense(bytes, dllPath, locate.AddLicenseRva, locate.AddLicenseIdx3Sites);
+                long b = PatchAddLicense(bytes, dllPath, locate.AddLicenseRva, locate.AddLicenseReadSites);
                 changes += b;
-                notes.Add("AddLicense: " + b + " idx3 read(s) -> ldc.i4.0");
+                notes.Add("AddLicense: " + b + " validateLicenseKey read(s) -> ldc.i4.0");
             }
             catch (Exception ex)
             {
@@ -198,16 +201,18 @@ internal sealed class DllPatcher
         public bool VerifyAlreadyPatched;
 
         public int AddLicenseRva;
-        public List<Idx3Site> AddLicenseIdx3Sites = new();
+        public List<ValidateLicenseKeyReadSite> AddLicenseReadSites = new();
         public string? AddLicenseUnsupported;
         public bool AddLicenseAlreadyPatched;
     }
 
-    /// <summary>A read of IL arg index 3 in AddLicense and the form it takes.</summary>
-    private sealed class Idx3Site
+    /// <summary>A read of the validateLicenseKey parameter in AddLicense and the IL form it takes.</summary>
+    private sealed class ValidateLicenseKeyReadSite
     {
         public int IlOffset;
-        public bool IsShortForm; // true: ldarg.3 (1 byte); false: ldarg.s 3 (2 bytes)
+        public bool IsShortForm; // true: ldarg.0..ldarg.3 (1 byte); false: ldarg.s <argIndex> (2 bytes)
+        public byte ShortOpcode; // valid when IsShortForm
+        public byte ArgIndexByte; // valid when !IsShortForm
     }
 
     private static LocateResult Locate(string dllPath)
@@ -249,21 +254,14 @@ internal sealed class DllPatcher
             (vins[0].OpCode == OpCodes.Ldc_I4_0 || vins[0].OpCode == OpCodes.Ldc_I4) &&
             vins[1].OpCode == OpCodes.Ret;
 
-        // (b) AddLicense instance method (UserLicense, bool, bool) -> bool.
+        // (b) AddLicense instance method (263+): (Lifetime, UserLicense, bool, bool) -> Task<bool>.
         var addLicense = module.GetTypes()
             .SelectMany(t => t.Methods)
-            .FirstOrDefault(m =>
-                m.Name == "AddLicense" &&
-                !m.IsStatic &&
-                m.Parameters.Count == 3 &&
-                m.Parameters[0].ParameterType.Name == "UserLicense" &&
-                m.Parameters[1].ParameterType.Name == "Boolean" &&
-                m.Parameters[2].ParameterType.Name == "Boolean" &&
-                m.ReturnType.Name == "Boolean");
+            .FirstOrDefault(IsSupportedAddLicenseMethod);
 
         if (addLicense == null)
         {
-            r.Error = "AddLicense(UserLicense, bool, bool) -> bool not found";
+            r.Error = "AddLicense(Lifetime, UserLicense, bool validateLicenseKey, bool) -> Task<bool> not found";
             return r;
         }
 
@@ -271,6 +269,85 @@ internal sealed class DllPatcher
         AnalyzeAddLicense(addLicense, r);
 
         return r;
+    }
+
+    private static bool IsSupportedAddLicenseMethod(MethodDefinition method)
+    {
+        if (method.Name != "AddLicense" || method.IsStatic)
+        {
+            return false;
+        }
+
+        if (method.Parameters.Count != 4)
+        {
+            return false;
+        }
+
+        if (!HasUserLicenseParameter(method))
+        {
+            return false;
+        }
+
+        if (!HasBooleanTailParameters(method))
+        {
+            return false;
+        }
+
+        return IsSupportedAddLicenseReturnType(method.ReturnType);
+    }
+
+    private static bool HasUserLicenseParameter(MethodDefinition method)
+    {
+        foreach (var parameter in method.Parameters)
+        {
+            if (parameter.ParameterType.Name == "UserLicense")
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool HasBooleanTailParameters(MethodDefinition method)
+    {
+        int count = method.Parameters.Count;
+        return method.Parameters[count - 1].ParameterType.Name == "Boolean" &&
+               method.Parameters[count - 2].ParameterType.Name == "Boolean";
+    }
+
+    private static bool IsSupportedAddLicenseReturnType(TypeReference returnType)
+    {
+        if (returnType is GenericInstanceType generic && generic.Name == "Task`1")
+        {
+            if (generic.GenericArguments.Count == 1 && generic.GenericArguments[0].Name == "Boolean")
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static ParameterDefinition GetValidateLicenseKeyParameter(MethodDefinition method)
+    {
+        foreach (var parameter in method.Parameters)
+        {
+            if (parameter.Name == "validateLicenseKey" && parameter.ParameterType.Name == "Boolean")
+            {
+                return parameter;
+            }
+        }
+
+        for (int index = method.Parameters.Count - 1; index >= 0; index--)
+        {
+            if (method.Parameters[index].ParameterType.Name == "Boolean")
+            {
+                return method.Parameters[index];
+            }
+        }
+
+        return method.Parameters[method.Parameters.Count - 1];
     }
 
     /// <summary>
@@ -307,58 +384,104 @@ internal sealed class DllPatcher
     }
 
     /// <summary>
-    /// Finds all reads of IL arg index 3 (validateLicenseKey) in AddLicense and
+    /// Finds all reads of the validateLicenseKey parameter in AddLicense and
     /// flags unsupported write/address forms. Uses Cecil opcode identification so
     /// we never rely on a memorised byte value.
     /// </summary>
-    private static void AnalyzeAddLicense(MethodDefinition m, LocateResult r)
+    private static void AnalyzeAddLicense(MethodDefinition method, LocateResult result)
     {
-        var body = m.Body;
-        var targetParam = m.Parameters[2]; // validateLicenseKey
-        int targetIlIndex = 2 + (m.IsStatic ? 0 : 1); // = 3 for an instance method
+        var targetParam = GetValidateLicenseKeyParameter(method);
+        int targetIlIndex = method.Parameters.IndexOf(targetParam) + (method.IsStatic ? 0 : 1);
 
-        foreach (var ins in body.Instructions)
+        foreach (var instruction in method.Body.Instructions)
         {
             bool readsTarget =
-                (ins.OpCode == OpCodes.Ldarg_3 && targetIlIndex == 3) ||
-                ((ins.OpCode == OpCodes.Ldarg_S || ins.OpCode == OpCodes.Ldarg) && ReferenceEquals(ins.Operand, targetParam));
+                IsShortLdargRead(instruction.OpCode, targetIlIndex) ||
+                ((instruction.OpCode == OpCodes.Ldarg_S || instruction.OpCode == OpCodes.Ldarg) && ReferenceEquals(instruction.Operand, targetParam));
 
-            bool addressesTarget = (ins.OpCode == OpCodes.Ldarga_S || ins.OpCode == OpCodes.Ldarga) && ReferenceEquals(ins.Operand, targetParam);
-            bool writesTarget = (ins.OpCode == OpCodes.Starg_S || ins.OpCode == OpCodes.Starg) && ReferenceEquals(ins.Operand, targetParam);
+            bool addressesTarget = (instruction.OpCode == OpCodes.Ldarga_S || instruction.OpCode == OpCodes.Ldarga) && ReferenceEquals(instruction.Operand, targetParam);
+            bool writesTarget = (instruction.OpCode == OpCodes.Starg_S || instruction.OpCode == OpCodes.Starg) && ReferenceEquals(instruction.Operand, targetParam);
 
             if (addressesTarget)
             {
-                r.AddLicenseUnsupported = "uses ldarga on validateLicenseKey (address-of); cannot patch with equal-length replacement";
+                result.AddLicenseUnsupported = "uses ldarga on validateLicenseKey (address-of); cannot patch with equal-length replacement";
                 return;
             }
 
             if (writesTarget)
             {
-                r.AddLicenseUnsupported = "uses starg on validateLicenseKey (write); cannot patch with equal-length replacement";
+                result.AddLicenseUnsupported = "uses starg on validateLicenseKey (write); cannot patch with equal-length replacement";
                 return;
             }
 
             if (readsTarget)
             {
-                // Only the two equal-length forms are supported.
-                if (ins.OpCode == OpCodes.Ldarg_3)
+                if (TryCreateReadSite(instruction, targetIlIndex, out ValidateLicenseKeyReadSite? site, out string? unsupported))
                 {
-                    r.AddLicenseIdx3Sites.Add(new Idx3Site { IlOffset = ins.Offset, IsShortForm = true });
-                }
-                else if (ins.OpCode == OpCodes.Ldarg_S)
-                {
-                    r.AddLicenseIdx3Sites.Add(new Idx3Site { IlOffset = ins.Offset, IsShortForm = false });
+                    result.AddLicenseReadSites.Add(site!);
                 }
                 else
                 {
-                    // Long-form ldarg (rare, not used for idx 3); refuse rather than risk corruption.
-                    r.AddLicenseUnsupported = "uses long-form ldarg on validateLicenseKey; unsupported";
+                    result.AddLicenseUnsupported = unsupported;
                     return;
                 }
             }
         }
 
-        r.AddLicenseAlreadyPatched = r.AddLicenseIdx3Sites.Count == 0;
+        result.AddLicenseAlreadyPatched = result.AddLicenseReadSites.Count == 0;
+    }
+
+    private static bool IsShortLdargRead(OpCode opCode, int targetIlIndex)
+    {
+        return (opCode == OpCodes.Ldarg_0 && targetIlIndex == 0) ||
+               (opCode == OpCodes.Ldarg_1 && targetIlIndex == 1) ||
+               (opCode == OpCodes.Ldarg_2 && targetIlIndex == 2) ||
+               (opCode == OpCodes.Ldarg_3 && targetIlIndex == 3);
+    }
+
+    private static bool TryCreateReadSite(Instruction instruction, int targetIlIndex, out ValidateLicenseKeyReadSite? site, out string? unsupported)
+    {
+        site = null;
+        unsupported = null;
+
+        if (instruction.OpCode == OpCodes.Ldarg_0 || instruction.OpCode == OpCodes.Ldarg_1 ||
+            instruction.OpCode == OpCodes.Ldarg_2 || instruction.OpCode == OpCodes.Ldarg_3)
+        {
+            site = new ValidateLicenseKeyReadSite
+            {
+                IlOffset = instruction.Offset,
+                IsShortForm = true,
+                ShortOpcode = GetShortLdargOpcode(targetIlIndex)
+            };
+            return true;
+        }
+
+        if (instruction.OpCode == OpCodes.Ldarg_S)
+        {
+            site = new ValidateLicenseKeyReadSite
+            {
+                IlOffset = instruction.Offset,
+                IsShortForm = false,
+                ArgIndexByte = (byte)targetIlIndex
+            };
+            return true;
+        }
+
+        // Long-form ldarg (4 bytes) cannot be replaced with an equal-length equivalent safely.
+        unsupported = "uses long-form ldarg on validateLicenseKey; unsupported";
+        return false;
+    }
+
+    private static byte GetShortLdargOpcode(int ilIndex)
+    {
+        return ilIndex switch
+        {
+            0 => OpLdarg0,
+            1 => OpLdarg1,
+            2 => OpLdarg2,
+            3 => OpLdarg3,
+            _ => throw new InvalidOperationException("ldarg." + ilIndex + " is not a single-byte opcode")
+        };
     }
 
     // ---- byte patching ----
@@ -392,7 +515,7 @@ internal sealed class DllPatcher
         return 12 + 6;
     }
 
-    private static long PatchAddLicense(byte[] bytes, string dllPath, int rva, List<Idx3Site> sites)
+    private static long PatchAddLicense(byte[] bytes, string dllPath, int rva, List<ValidateLicenseKeyReadSite> sites)
     {
         int headerOffset = RvaToFileOffset(dllPath, rva);
         int codeStart = ParseFatHeaderAndCodeStart(bytes, headerOffset);
@@ -403,16 +526,14 @@ internal sealed class DllPatcher
             int off = codeStart + site.IlOffset;
             if (site.IsShortForm)
             {
-                // Expect ldarg.3 (0x05) -> ldc.i4.0 (0x16). Equal length (1 byte).
-                Expect(bytes, off, OpLdarg3, "ldarg.3");
+                Expect(bytes, off, site.ShortOpcode, "ldarg." + GetShortLdargIndex(site.ShortOpcode));
                 bytes[off] = OpLdcI40;
                 changes++;
             }
             else
             {
-                // Expect ldarg.s 3 (0x11 0x03) -> ldc.i4.0; nop (0x16 0x00). Equal length (2 bytes).
                 Expect(bytes, off, OpLdargS, "ldarg.s");
-                Expect(bytes, off + 1, 0x03, "ldarg.s operand (arg index 3)");
+                Expect(bytes, off + 1, site.ArgIndexByte, "ldarg.s operand (arg index " + site.ArgIndexByte + ")");
                 bytes[off] = OpLdcI40;
                 bytes[off + 1] = OpNop;
                 changes += 2;
@@ -420,6 +541,18 @@ internal sealed class DllPatcher
         }
 
         return changes;
+    }
+
+    private static int GetShortLdargIndex(byte opcode)
+    {
+        return opcode switch
+        {
+            OpLdarg0 => 0,
+            OpLdarg1 => 1,
+            OpLdarg2 => 2,
+            OpLdarg3 => 3,
+            _ => -1
+        };
     }
 
     private static void Expect(byte[] bytes, int offset, byte expected, string what)
