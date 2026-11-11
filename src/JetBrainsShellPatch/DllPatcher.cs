@@ -51,7 +51,7 @@ internal sealed class DllPatcher
     private const byte OpNop = 0x00;      // nop
     private const byte OpRet = 0x2A;      // ret
     private const byte OpLdcI4 = 0x20;    // ldc.i4 (followed by int32)
-    private const byte OpLdargS = 0x11;   // ldarg.s (followed by byte arg index)
+    private const byte OpLdargS = 0x0E;   // ldarg.s (followed by byte arg index)
 
     private const int FatMaxStack = 8;
 
